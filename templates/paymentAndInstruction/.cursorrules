@@ -1,0 +1,187 @@
+# SaveFood — .cursorrules
+# Expert ASP.NET Core 8 Backend Rules for AI Coding Agents
+# ============================================================
+# READ THIS ENTIRELY BEFORE GENERATING ANY CODE.
+# These rules are ABSOLUTE. Deviation is NOT allowed unless the user explicitly overrides.
+
+## IDENTITY
+You are an Expert .NET 8 Backend Engineer working on SaveFood — a web marketplace for near-expiry food.
+Tech: ASP.NET Core 8, C# 12, SQL Server, Entity Framework Core 8, deployed on Render via Docker.
+
+---
+
+## ARCHITECTURE (NON-NEGOTIABLE)
+
+- Pattern: N-Tier + Repository Pattern
+- Flow: Controller → Service → Repository → DbContext
+- NEVER put business logic in Controllers
+- NEVER call DbContext directly outside Repository classes
+- NEVER expose EF entities directly from API endpoints — always use DTOs
+- ONE DbContext (SaveFoodDbContext), registered as Scoped
+- ALL async — never use .Result or .Wait()
+- Global Exception Handling Middleware handles ALL unhandled exceptions
+- ALWAYS define an I{Name} interface before any Repository or Service implementation
+
+---
+
+## PROJECT STRUCTURE
+
+```
+src/SaveFood.API/          → Controllers, Middleware, Extensions, Program.cs
+src/SaveFood.Application/  → DTOs, Interfaces, Services, Validators, Mappings, Common
+src/SaveFood.Domain/       → Entities, Enums, Constants
+src/SaveFood.Infrastructure/ → Data (DbContext, Config, Migrations), Repositories, Services, Jobs
+```
+
+Project references: API → Application + Infrastructure; Infrastructure → Application + Domain; Application → Domain
+
+---
+
+## ENTITIES & ENUMS
+
+All entities inherit BaseEntity (Id: Guid, CreatedAt, UpdatedAt, IsDeleted: bool).
+SOFT DELETE ONLY — never DELETE rows, set IsDeleted = true.
+Global query filters on DbContext exclude IsDeleted = true for Product, Order, Store.
+
+Key entities: ApplicationUser, Store, Product, Order, OrderItem, RefreshToken
+Enums: ProductStatus (Active, Expired, SoldOut, Removed), OrderStatus (Pending, Confirmed, Preparing, Delivered, Cancelled), UserRole (Admin, StoreOwner, Customer)
+
+ApplicationUser : IdentityUser<Guid> — adds FullName, AvatarUrl, Role (UserRole enum), StoreId (Guid?)
+
+---
+
+## DTO RULES
+
+- Request DTOs: suffix "Request" (e.g. CreateProductRequest)  
+- Response DTOs: suffix "Response" (e.g. ProductResponse)
+- Use C# records for immutable DTOs
+- NO nested EF entity objects — flatten or use dedicated nested response DTOs
+- AutoMapper handles ALL Entity↔DTO mapping — never write manual new DTO { ... } blocks
+- AutoMapper profiles live in Application/Mappings/
+
+---
+
+## VALIDATION
+
+- FluentValidation for ALL request DTOs (never DataAnnotations on DTOs)
+- Validators in Application/Validators/
+- Register: builder.Services.AddValidatorsFromAssemblyContaining<T>() + AddFluentValidationAutoValidation()
+- Always validate: ExpiryDate > UtcNow, DiscountedPrice < OriginalPrice, positive quantities
+
+---
+
+## AUTHENTICATION
+
+- ASP.NET Core Identity + JWT Bearer
+- Refresh tokens stored in DB (RefreshToken entity), hashed with HMACSHA512
+- Google OAuth: Microsoft.AspNetCore.Authentication.Google
+- Facebook OAuth: Microsoft.AspNetCore.Authentication.Facebook
+- JWT claims MUST include: userId, email, fullName, storeId, roles
+- ClockSkew = TimeSpan.Zero (no tolerance for expired tokens)
+- SignalR: read JWT from query string "access_token" for hub connections
+
+Role-based auth:
+- [Authorize(Roles = "Admin")] for admin endpoints
+- [Authorize(Roles = "StoreOwner,Admin")] for product/store management
+- [Authorize(Roles = "Customer")] for placing orders
+- [Authorize] for authenticated-only (any role)
+
+---
+
+## GLOBAL EXCEPTION HANDLING
+
+GlobalExceptionMiddleware maps exceptions to HTTP responses:
+- SecurityTokenExpiredException → 401, code: TOKEN_EXPIRED
+- UnauthorizedAccessException → 403, code: FORBIDDEN
+- ProductExpiredException → 422, code: PRODUCT_EXPIRED
+- InsufficientStockException → 422, code: OUT_OF_STOCK
+- NotFoundException → 404, code: NOT_FOUND
+- ValidationException → 400, code: VALIDATION_ERROR
+- All others → 500, code: SERVER_ERROR
+
+Custom exceptions live in Application/Common/Exceptions/
+Response format: { code: string, message: string, timestamp: DateTime }
+
+---
+
+## BACKGROUND JOBS (HANGFIRE)
+
+- ProductExpiryJob: runs every 30 minutes ("*/30 * * * *")
+  - Queries products where ExpiryDate <= UtcNow and Status == Active
+  - Sets Status = ProductStatus.Expired
+  - Notifies store owner via SignalR: hub.Clients.Group("store-{storeId}").SendAsync("ProductExpired", ...)
+- LowStockNotificationJob: runs every hour
+  - Notifies stores when StockQuantity <= 5
+- Hangfire dashboard at /hangfire, protected by HangfireAdminFilter (Admin role only)
+- Storage: Hangfire.SqlServer (same connection string)
+
+---
+
+## SIGNALR NOTIFICATIONS
+
+Hub: NotificationHub (requires [Authorize])
+OnConnectedAsync: add user to groups "store-{storeId}" (if StoreOwner) and "user-{userId}"
+Events to implement: OrderPlaced, OrderStatusChanged, ProductExpired, LowStock
+
+---
+
+## VNPAY PAYMENT
+
+- VNPayService implements IVNPayService
+- CreatePaymentUrl: builds sorted query params + HMAC-SHA512 signature
+- ProcessCallback: validates HMAC-SHA512 + checks vnp_ResponseCode == "00"
+- Amount in VNPay = actual amount × 100 (integer, no decimals)
+- Timestamp format: yyyyMMddHHmmss in GMT+7
+- PaymentController: POST /api/payment/create-vnpay/{orderId}, GET /api/payment/vnpay-return
+
+---
+
+## NUGET PACKAGES (ALL MANDATORY)
+
+Microsoft.AspNetCore.Identity.EntityFrameworkCore 8.x
+Microsoft.EntityFrameworkCore.SqlServer 8.x
+Microsoft.EntityFrameworkCore.Tools 8.x
+Microsoft.AspNetCore.Authentication.JwtBearer 8.x
+Microsoft.AspNetCore.Authentication.Google 8.x
+Microsoft.AspNetCore.Authentication.Facebook 8.x
+AutoMapper 13.x
+AutoMapper.Extensions.Microsoft.DependencyInjection 12.x
+FluentValidation.AspNetCore 11.x
+Hangfire.AspNetCore 1.8.x
+Hangfire.SqlServer 1.8.x
+Microsoft.AspNetCore.SignalR 8.x
+Serilog.AspNetCore 8.x
+Serilog.Sinks.Console 5.x
+Serilog.Sinks.File 5.x
+Swashbuckle.AspNetCore 6.x
+
+---
+
+## CODING CONVENTIONS
+
+- PascalCase: classes, methods, properties, enums
+- camelCase: local variables, parameters
+- _camelCase: private instance fields
+- Use nameof() instead of magic strings for property names
+- Every async repository/service method MUST accept CancellationToken ct = default
+- All list endpoints return PaginatedList<T> (PageNumber, PageSize, TotalCount, Items)
+- All API responses wrapped in ApiResponse<T> { bool Success, string Message, T? Data }
+- Logging: Serilog only via ILogger<T>; Information for business events, Error for exceptions
+- Never log sensitive data (passwords, tokens, payment secrets)
+
+---
+
+## RENDER DEPLOYMENT
+
+- Dockerfile: multi-stage build (sdk:8.0 build → aspnet:8.0 runtime), EXPOSE 8080
+- Apply EF migrations on startup: db.Database.MigrateAsync() inside scoped service
+- All secrets via environment variables (NEVER hardcode): ConnectionStrings__DefaultConnection, Jwt__Key, VNPay__HashSecret, etc.
+- ASPNETCORE_URLS=http://+:8080 (Render uses port 8080)
+
+---
+
+## DI REGISTRATION
+
+All registrations in API/Extensions/ServiceCollectionExtensions.cs via extension methods.
+Pattern: services.AddScoped<IInterface, Implementation>()
+Never use concrete types directly in constructors — always inject interfaces.
